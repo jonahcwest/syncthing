@@ -1905,6 +1905,143 @@ func TestConfigChanges(t *testing.T) {
 	}
 }
 
+func TestConfigFolderPathRequired(t *testing.T) {
+	t.Parallel()
+
+	// Creating or replacing a folder should not inherit the default folder
+	// path when path is empty
+	cases := []struct {
+		name        string
+		defaultPath string
+	}{
+		{name: "without default path", defaultPath: ""},
+		{name: "with default path", defaultPath: "default-folder-path"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := config.Configuration{
+				// Current version so migrations don't clear the default folder path
+				Version: config.CurrentVersion,
+				GUI: config.GUIConfiguration{
+					RawAddress: "127.0.0.1:0",
+					RawUseTLS:  false,
+					APIKey:     testAPIKey,
+				},
+			}
+			cfg.Defaults.Folder.Path = tc.defaultPath
+			tmpFile, err := os.CreateTemp("", "syncthing-testConfig-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.Remove(tmpFile.Name())
+			w := config.Wrap(tmpFile.Name(), cfg, protocol.LocalDeviceID, events.NoopLogger)
+			tmpFile.Close()
+			cfgCtx, cfgCancel := context.WithCancel(context.Background())
+			go w.Serve(cfgCtx)
+			defer cfgCancel()
+			baseURL := startHTTP(t, w)
+
+			cli := &http.Client{
+				Timeout: time.Minute,
+			}
+
+			do := func(req *http.Request, status int) *http.Response {
+				t.Helper()
+				req.Header.Set("X-API-Key", testAPIKey)
+				resp, err := cli.Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if resp.StatusCode != status {
+					t.Errorf("Expected status %v for %s %s, got %v", status, req.Method, req.URL.Path, resp.StatusCode)
+				}
+				return resp
+			}
+
+			mod := func(method, path string, data any, status int) {
+				t.Helper()
+				bs, err := json.Marshal(data)
+				if err != nil {
+					t.Fatal(err)
+				}
+				req, _ := http.NewRequest(method, baseURL+path, bytes.NewReader(bs))
+				do(req, status).Body.Close()
+			}
+
+			get := func(path string, status int) *http.Response {
+				t.Helper()
+				req, _ := http.NewRequest(http.MethodGet, baseURL+path, nil)
+				return do(req, status)
+			}
+
+			folder1Path := "/rest/config/folders/folder1"
+
+			// Missing or empty path is refused on every create/replace endpoint
+			for _, fcfg := range []map[string]string{
+				{"id": "folder1"},
+				{"id": "folder1", "path": ""},
+			} {
+				mod(http.MethodPost, "/rest/config/folders", fcfg, http.StatusBadRequest)
+				mod(http.MethodPut, folder1Path, fcfg, http.StatusBadRequest)
+				mod(http.MethodPut, "/rest/config/folders", []map[string]string{fcfg}, http.StatusBadRequest)
+			}
+
+			// Check it was not added
+			get(folder1Path, http.StatusNotFound).Body.Close()
+
+			// Create folder with an explicit path
+			mod(http.MethodPost, "/rest/config/folders", config.FolderConfiguration{ID: "folder1", Path: "folder1"}, http.StatusOK)
+
+			// Modify just a single attribute, without repeating the path
+			mod(http.MethodPatch, folder1Path, map[string]bool{"Paused": true}, http.StatusOK)
+
+			// Explicitly clearing the path is refused
+			mod(http.MethodPatch, folder1Path, map[string]string{"path": ""}, http.StatusBadRequest)
+
+			// Check the path was kept
+			resp := get(folder1Path, http.StatusOK)
+			var folder config.FolderConfiguration
+			if err := unmarshalTo(resp.Body, &folder); err != nil {
+				t.Fatal(err)
+			}
+			if folder.Path != "folder1" {
+				t.Error("Expected path folder1, got", folder.Path)
+			}
+			if !folder.Paused {
+				t.Error("Expected folder to be paused")
+			}
+
+			// Posting the full config with a folder missing a path is also refused
+			resp = get("/rest/config", http.StatusOK)
+			var fullCfg map[string]any
+			if err := unmarshalTo(resp.Body, &fullCfg); err != nil {
+				t.Fatal(err)
+			}
+			fullCfg["folders"] = append(fullCfg["folders"].([]any), map[string]string{"id": "folder2"})
+			mod(http.MethodPut, "/rest/config", fullCfg, http.StatusBadRequest)
+			get("/rest/config/folders/folder2", http.StatusNotFound).Body.Close()
+
+			// The default folder may still have an empty path
+			defaultFolderPath := "/rest/config/defaults/folder"
+			mod(http.MethodPut, defaultFolderPath, map[string]string{"path": ""}, http.StatusOK)
+			mod(http.MethodPatch, defaultFolderPath, map[string]string{"path": ""}, http.StatusOK)
+
+			// Check the default path was cleared
+			resp = get(defaultFolderPath, http.StatusOK)
+			var defaultFolder config.FolderConfiguration
+			if err := unmarshalTo(resp.Body, &defaultFolder); err != nil {
+				t.Fatal(err)
+			}
+			if defaultFolder.Path != "" {
+				t.Error("Expected empty default path, got", defaultFolder.Path)
+			}
+		})
+	}
+}
+
 func TestSanitizedHostname(t *testing.T) {
 	cases := []struct {
 		in, out string
